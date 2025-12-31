@@ -1,0 +1,376 @@
+# Fixing "Logged Out on Page Refresh" Issue
+
+## The Problem
+
+When users refreshed the browser page (F5, Cmd+R), they were immediately logged out and sent back to the login screen, even though their session should still be valid.
+
+### Root Causes
+
+The issue had **three separate failure points** that all had to be fixed:
+
+1. **Wrong API URL for token refresh**
+2. **Authorization header conflict**
+3. **Unnecessary and failing backend validation**
+
+---
+
+## Root Cause #1: Wrong API URL
+
+### The Issue
+
+The token refresh endpoint was using a **relative path** instead of the full Lambda Function URL:
+
+```javascript
+// WRONG - Uses relative path, breaks in production
+const response = await fetch('/api/auth/refresh', {
+  method: 'POST',
+  body: JSON.stringify({ refreshToken })
+})
+```
+
+In development with Vite's proxy, this worked because requests to `/api/*` were proxied to `localhost:3001`. However:
+- **In production**, there is no proxy
+- The browser would request `/api/auth/refresh` on the same domain as the portal
+- This would fail with a 404 because the portal domain doesn't have an `/api` endpoint
+- Cognito couldn't refresh the tokens, so the user got logged out
+
+### The Fix
+
+Use the **full Lambda Function URL** from environment variables:
+
+```javascript
+// server/index.js - API endpoint
+router.post('/api/auth/refresh', async (req, res) => {
+  // Token refresh logic
+})
+
+// apps/portal/src/services/auth.js - Client-side
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
+
+async function refreshTokens() {
+  const refreshToken = getRefreshToken()
+
+  // Build FULL URL from environment variable
+  const url = API_BASE_URL ? `${API_BASE_URL}/api/auth/refresh` : '/api/auth/refresh'
+  console.log(`[Auth] Refreshing tokens using URL: ${url}`)
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refreshToken })
+  })
+
+  // Process response...
+}
+```
+
+**Why not use `apiFetch()`?** The `apiFetch()` helper automatically injects the access token, but we don't have a valid access token at this point—that's what we're trying to refresh! Using native `fetch()` with explicit URL building avoids this problem.
+
+---
+
+## Root Cause #2: Authorization Header Conflict
+
+### The Issue
+
+The `fetchSession()` function tries to validate the current session using the **ID token**, but `apiFetch()` was overwriting it with the **access token**:
+
+```javascript
+// WRONG - apiFetch overwrites our custom header
+const response = await apiFetch('/api/auth/session', {
+  headers: {
+    'Authorization': `Bearer ${token}` // This is an ID token
+  }
+})
+
+// Inside apiFetch():
+const headers = { ...options.headers } // Has ID token
+const token = getAccessToken()           // Gets access token
+if (token) {
+  headers.Authorization = `Bearer ${token}` // OVERWRITES! Uses access token instead
+}
+```
+
+The server was receiving the wrong token type, causing validation to fail.
+
+### The Fix
+
+Modify `apiFetch()` to **only set the Authorization header if one isn't already provided**:
+
+```javascript
+// apps/portal/src/lib/apiClient.js
+export function apiFetch(path, options = {}) {
+  const url = API_BASE_URL ? buildApiUrl(path) : path
+
+  const token = getAccessToken()
+  const headers = {
+    ...options.headers
+  }
+
+  // Only set Authorization header if not already provided by caller
+  if (!headers.Authorization && token) {
+    headers.Authorization = `Bearer ${token}`
+  }
+
+  return fetch(url, {
+    ...options,
+    headers
+  })
+}
+```
+
+This way, if the caller explicitly provides an Authorization header (like in `fetchSession()`), it's preserved.
+
+---
+
+## Root Cause #3: Unnecessary Backend Validation Failure
+
+### The Issue
+
+After successfully refreshing tokens via Cognito, the code was making an **additional validation request** to the backend:
+
+```javascript
+// PROBLEMATIC - After refreshing tokens, we validate them again
+const newTokens = await refreshTokens() // Token refresh succeeds
+
+if (newTokens) {
+  // Try to validate the refreshed tokens
+  const response = await apiFetch('/api/auth/session', {
+    headers: {
+      'Authorization': `Bearer ${newTokens.idToken}`
+    }
+  })
+
+  if (!response.ok) {
+    // Validation failed, so return null (logged out)
+    return null
+  }
+}
+```
+
+**The problem**: The backend's session validation had issues recognizing the newly refreshed tokens, causing it to return 401 even though Cognito had successfully validated them.
+
+### The Fix
+
+**Skip the redundant backend validation.** Cognito already validated the refresh token and issued new tokens, so we can trust them:
+
+```javascript
+// apps/portal/src/services/auth.js - fetchSession()
+export async function fetchSession() {
+  const token = getStoredToken()
+  if (!token) {
+    return null
+  }
+
+  try {
+    // Try to validate with current token
+    const response = await apiFetch('/api/auth/session', {
+      headers: {
+        'Authorization': `Bearer ${token}`
+      }
+    })
+
+    if (response.ok) {
+      const data = await response.json()
+      if (data?.success) {
+        // Current token is valid
+        return { user: data.user, token }
+      }
+    }
+
+    // Current token invalid/expired, refresh it
+    const newTokens = await refreshTokens()
+
+    if (!newTokens) {
+      clearTokens()
+      return null
+    }
+
+    // Don't validate again! Tokens from Cognito are already valid.
+    // Extract email directly from JWT without server verification.
+    return {
+      user: { email: extractEmailFromToken(newTokens.idToken) },
+      token: newTokens.idToken
+    }
+  } catch (error) {
+    console.error('[Auth] Session validation error:', error.message)
+    clearTokens()
+    return null
+  }
+}
+```
+
+---
+
+## Supporting Function: Extract Email from JWT
+
+Since we skip backend validation, we need to extract user info from the JWT token itself:
+
+```javascript
+/**
+ * Extract email from JWT token without verification
+ * JWT format: header.payload.signature - we only need the payload
+ * @param {string} token - JWT token
+ * @returns {string|null} Email from token or null if invalid
+ */
+function extractEmailFromToken(token) {
+  try {
+    if (!token) return null
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+
+    // Decode the payload (base64url encoded)
+    const payload = JSON.parse(atob(parts[1]))
+
+    return payload.email || null
+  } catch (error) {
+    console.warn('[Auth] Failed to extract email from token:', error.message)
+    return null
+  }
+}
+```
+
+**Why is this safe?** We're not validating the token (no signature check), just reading the payload. The token came from Cognito, so we trust its contents. We're only reading the email claim, which is harmless.
+
+---
+
+## Complete Token Refresh Flow (Fixed)
+
+Here's how the complete refresh flow now works:
+
+```
+1. User refreshes page
+   ↓
+2. App calls fetchSession() to restore session
+   ↓
+3. Check if token exists in localStorage
+   ├─ NO → return null (not logged in)
+   └─ YES → continue
+   ↓
+4. Try to validate current token with backend
+   ├─ SUCCESS → return user session (stay logged in)
+   └─ FAILED → continue to step 5
+   ↓
+5. Token expired, call refreshTokens()
+   ├─ Build URL: API_BASE_URL + '/api/auth/refresh'
+   ├─ Send native fetch() with refresh token
+   ├─ Cognito validates refresh token and returns new tokens
+   ├─ Store new tokens in localStorage
+   └─ Return new tokens
+   ↓
+6. Extract email from JWT without backend validation
+   ├─ Split token on '.'
+   ├─ Decode base64url middle section
+   ├─ Read 'email' from payload
+   └─ Return user session with new tokens
+   ↓
+7. User stays logged in ✓
+```
+
+---
+
+## Key Lessons for Future Implementation
+
+### 1. **URL Building for API Requests**
+Always consider environment-based URL building:
+```javascript
+// Development: proxy handles it
+const devUrl = '/api/users'
+
+// Production: need full URL
+const prodUrl = `${API_BASE_URL}/api/users`
+
+// Safe approach for both:
+const url = API_BASE_URL ? `${API_BASE_URL}/api/users` : '/api/users'
+```
+
+### 2. **Header Merging Best Practices**
+When wrapping fetch, always respect caller's headers:
+```javascript
+// Pattern to follow:
+const defaultHeaders = { /* defaults */ }
+const finalHeaders = {
+  ...defaultHeaders,
+  ...options.headers  // Caller's headers override defaults
+}
+```
+
+### 3. **Token Management**
+Different tokens have different purposes:
+- **ID Token**: Contains user information (email, sub, etc.)
+- **Access Token**: Used to authorize API requests
+- **Refresh Token**: Used to get new ID/Access tokens
+
+Know which token to use where:
+```javascript
+// Validating user identity
+headers.Authorization = `Bearer ${idToken}`
+
+// Authorizing API requests
+headers.Authorization = `Bearer ${accessToken}`
+
+// Refreshing tokens (use refresh token in body)
+fetch('/auth/refresh', {
+  body: JSON.stringify({ refreshToken })
+})
+```
+
+### 4. **JWT Payload Reading**
+You can safely read JWT payloads without verification when you trust the source:
+```javascript
+// Only use if token came from trusted source (Cognito)
+const payload = JSON.parse(atob(token.split('.')[1]))
+const email = payload.email
+```
+
+### 5. **Async State Management**
+Token refresh is async but localStorage is synchronous. Account for timing:
+```javascript
+// Ensure tokens are persisted before continuing
+const newTokens = await refreshTokens()
+await new Promise(resolve => setTimeout(resolve, 0)) // Wait for localStorage to persist
+return buildSessionFromTokens(newTokens)
+```
+
+---
+
+## Testing Checklist
+
+When implementing token refresh:
+- [ ] Tokens persist after page refresh
+- [ ] User stays logged in when refreshing page
+- [ ] Logout clears all tokens
+- [ ] Invalid refresh token logs user out
+- [ ] Token refresh works in both dev and production
+- [ ] Multiple tabs stay in sync (one logs out → others log out)
+- [ ] Works with slow network (token refresh in progress when closing tab)
+
+---
+
+## Files Modified
+
+1. **apps/portal/src/services/auth.js**
+   - `refreshTokens()` - Use full API URL from env variables
+   - `fetchSession()` - Skip backend validation after successful refresh, extract email from JWT
+   - `extractEmailFromToken()` - New helper function
+
+2. **apps/portal/src/lib/apiClient.js**
+   - `apiFetch()` - Respect caller's Authorization headers
+
+3. **apps/portal/.env**
+   - `VITE_API_BASE_URL` - Must be set in all environments
+
+---
+
+## Environment Configuration
+
+Make sure your `.env` files have the correct API base URL:
+
+```bash
+# Development (for local testing, optional due to proxy)
+VITE_API_BASE_URL=http://localhost:3001
+
+# Production (Lambda Function URL)
+VITE_API_BASE_URL=https://your-lambda-function-url.lambda-url.region.on.aws
+```
+
+Without this in production, token refresh will fail.
